@@ -54,6 +54,7 @@ def do_patch(target_dir):
         "ohos_pnm-calloc-init.patch",
         "ohos_ppdgenerator-bound-check.patch",
         "ohos_pdftopdf-print-effect-fix.patch",
+        "ohos_colormanager-icc-path-validation.patch",
     ]
 
     for patch in patch_file:
