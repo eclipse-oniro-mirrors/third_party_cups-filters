@@ -1,0 +1,230 @@
+diff --git a/cupsfilters/colormanager.c b/cupsfilters/colormanager.c
+index b443718f..82e9da36 100644
+--- a/cupsfilters/colormanager.c
++++ b/cupsfilters/colormanager.c
+@@ -29,6 +29,11 @@ MIT Open Source License  -  http://www.opensource.org/
+ #include "colormanager.h"
+ #include <cupsfilters/colord.h>
+ //#include <cupsfilters/kmdevices.h>
++#include <stdlib.h>
++#include <string.h>
++#include <limits.h>
++#include <ctype.h>
++#include <sys/stat.h>
+ 
+ 
+ #define CM_MAX_FILE_LENGTH 1024
+@@ -42,6 +47,11 @@ static int      _get_colord_profile             (const char *printer_name,
+                                                  ppd_file_t *ppd);
+ static char    *_get_ppd_icc_fallback           (ppd_file_t *ppd, 
+                                                  char **qualifier);
++static int      _has_control_chars              (const char *s);
++static int      _path_has_dotdot_segment        (const char *path);
++static int      _icc_profile_path_is_allowed    (const char *candidate,
++                                                 char *resolved,
++                                                 size_t resolvedsize);
+ 
+ 
+ 
+@@ -250,7 +260,7 @@ _get_colord_profile(const char   *printer_name,     /* Dest name */
+ 
+     if (icc_profile) 
+       is_profile_set = 1; 
+-    else if (ppd) {
++    else if (ppd != NULL && qualifier != NULL) {
+     /* Get optional fallback PPD profile */
+       icc_profile = _get_ppd_icc_fallback(ppd, qualifier);
+       if (icc_profile)
+@@ -284,16 +294,114 @@ _get_colord_profile(const char   *printer_name,     /* Dest name */
+ #define CUPSDATA "/usr/share/cups"
+ #endif
+ 
++/* check for C0/C1 control characters, used to keep PPD-supplied strings
++   safe to write to stderr (CUPS forwards filter stderr to the job log) */
++static int
++_has_control_chars (const char *s)                 /* String to check */
++{
++  const char *c;
++
++  for (c = s; *c != '\0'; c++)
++    if (iscntrl((unsigned char)*c))
++      return 1;
++  return 0;
++}
++
++/* check for ".." as a complete path segment (not as a substring of
++   legitimate file names such as "Driver..2.icc"); a lone "." segment is
++   harmless and gets folded away by realpath() during validation */
++static int
++_path_has_dotdot_segment (const char *path)         /* Path to check */
++{
++  const char *p = path;
++  int         at_segment_start = 1;   /* start of string behaves as if preceded by '/' */
++
++  /* forward-only scan: a ".." is a segment only when bounded by string start
++     or '/' on the left and string end or '/' on the right */
++  while (*p != '\0') {
++    if (at_segment_start && p[0] == '.' && p[1] == '.' &&
++        (p[2] == '\0' || p[2] == '/'))
++      return 1;
++    at_segment_start = (*p == '/');
++    p++;
++  }
++  return 0;
++}
++
++/*
++ * Validate an attacker-controlled ICC profile path candidate: resolve it
++ * to a canonical absolute path (following symlinks, "." and ".." segments),
++ * require it to be a regular file (same type rule as CUPS' _cupsFileCheck),
++ * and accept it only if it lies inside one of the known profile directories.
++ * On success the canonical path is written to "resolved" and 1 is returned.
++ */
++static int
++_icc_profile_path_is_allowed (const char *candidate,       /* Path to check */
++                              char       *resolved,        /* Canonical path out */
++                              size_t      resolvedsize)    /* Size of resolved */
++{
++  const char *prefixes[2];
++  char        realdir[PATH_MAX];
++  size_t      dir_len;
++  int         numprefixes = 0;
++  int         i;
++  struct stat fileinfo;                   /* File type information */
++
++  if (candidate == NULL || candidate[0] == '\0' ||
++      resolved == NULL || resolvedsize < PATH_MAX ||
++      strlen(candidate) >= PATH_MAX)
++    return 0;
++
++  /* realpath() also implies the existence check, replacing access() */
++  if (realpath(candidate, resolved) == NULL)
++    return 0;
++
++  /* regular files only: never hand out a directory or device node (aligns
++     with CUPS' _cupsFileCheck() file-type rule) */
++  if (stat(resolved, &fileinfo) != 0 || !S_ISREG(fileinfo.st_mode))
++    return 0;
++
++  prefixes[numprefixes++] = CUPSDATA "/profiles";
++#ifdef CUPS_DATADIR
++  /* config.h may set CUPS_DATADIR == CUPSDATA; avoid checking twice */
++  if (strcmp(prefixes[0], CUPS_DATADIR "/profiles") != 0)
++    prefixes[numprefixes++] = CUPS_DATADIR "/profiles";
++#endif
++
++  for (i = 0; i < numprefixes; i++) {
++    /* Skip whitelist dirs that do not exist on this system */
++    if (realpath(prefixes[i], realdir) == NULL)
++      continue;
++    dir_len = strlen(realdir);
++    /* Require a path-component boundary after the prefix so that
++       "/foo/profiles2" cannot match "/foo/profiles" */
++    if (strncmp(resolved, realdir, dir_len) == 0 &&
++        resolved[dir_len] == '/')
++      return 1;
++  }
++
++  return 0;
++}
++
+ /* From gstoraster */
+ char *
+ _get_ppd_icc_fallback (ppd_file_t *ppd, char **qualifier)
+ {
+   char full_path[1024];
++  char real_path[PATH_MAX];
+   char *icc_profile = NULL;
+   char qualifer_tmp[1024];
+   const char *profile_key;
++  int  path_len;
+   ppd_attr_t *attr;
+ 
++  /* refuse to work without a valid PPD or color qualifier */
++  if (ppd == NULL || qualifier == NULL ||
++      qualifier[0] == NULL || qualifier[1] == NULL || qualifier[2] == NULL) {
++    fprintf(stderr, "INFO: Color Manager: invalid PPD or qualifier for profile lookup\n");
++    return NULL;
++  }
++
+   /* get profile attr, falling back to CUPS */
+   profile_key = "APTiogaProfile";
+   attr = ppdFindAttr(ppd, profile_key, NULL);
+@@ -317,41 +425,62 @@ _get_ppd_icc_fallback (ppd_file_t *ppd, char **qualifier)
+ 
+   /* try to find a profile that matches the qualifier exactly */
+   for (;attr != NULL; attr = ppdFindNextAttr(ppd, profile_key, NULL)) {
+-    fprintf(stderr, "INFO: Color Manager: found profile %s in PPD with qualifier '%s'\n",
+-            attr->value, attr->spec);
+-
+     /* invalid entry */
+     if (attr->spec == NULL || attr->value == NULL)
+       continue;
+ 
++    /* the value is attacker-controlled (the PPD may come from an
++       untrusted source): reject empty, over-long, "." / ".." path
++       segments and control characters BEFORE logging or using it as
++       a path, so nothing unsanitized reaches stderr either */
++    if (attr->value[0] == '\0' ||
++        strlen(attr->value) >= sizeof(full_path) ||
++        _path_has_dotdot_segment(attr->value) ||
++        _has_control_chars(attr->value) ||
++        _has_control_chars(attr->spec)) {
++      fprintf(stderr, "INFO: Color Manager: rejected malformed profile entry in PPD\n");
++      continue;
++    }
++
++    fprintf(stderr, "INFO: Color Manager: found profile %s in PPD with qualifier '%s'\n",
++            attr->value, attr->spec);
++
+     /* expand to a full path if not already specified */
+     if (attr->value[0] != '/')
+-      snprintf(full_path, sizeof(full_path),
+-               "%s/profiles/%s", CUPSDATA, attr->value);
+-    else {
+-      strncpy(full_path, attr->value, sizeof(full_path) - 1);
+-      if (strlen(attr->value) > 1023)
+-        full_path[1023] = '\0';
++      path_len = snprintf(full_path, sizeof(full_path),
++                          "%s/profiles/%s", CUPSDATA, attr->value);
++    else
++      path_len = snprintf(full_path, sizeof(full_path),
++                          "%s", attr->value);
++    if (path_len < 0 || (size_t)path_len >= sizeof(full_path)) {
++      fprintf(stderr, "INFO: Color Manager: rejected over-long profile entry in PPD\n");
++      continue;
+     }
+ 
+-    /* check the file exists */
+-    if (access(full_path, 0)) {
+-      fprintf(stderr, "INFO: Color Manager: found profile %s in PPD that does not exist\n",
++    /* check the file exists and is inside an allowed profile directory */
++    if (_icc_profile_path_is_allowed(full_path, real_path,
++                                     sizeof(real_path)) == 0) {
++      fprintf(stderr, "INFO: Color Manager: found profile %s in PPD "
++                      "that does not exist or is not allowed\n",
+               full_path);
+       continue;
+     }
+ 
+     /* matches the qualifier */
+     if (strcmp(qualifer_tmp, attr->spec) == 0) {
+-      icc_profile = strdup(full_path);
++      /* hand out the canonical (symlink-resolved) path */
++      icc_profile = strdup(real_path);
+       goto out;
+     }
+   }
+ 
+   /* no match */
+   if (attr == NULL) {
+-    fprintf(stderr, "INFO: Color Manager: no profiles in PPD for qualifier '%s'\n",
+-            qualifer_tmp);
++    if (_has_control_chars(qualifer_tmp))
++      fprintf(stderr, "INFO: Color Manager: no profiles in PPD for malformed qualifier\n");
++    else
++      fprintf(stderr, "INFO: Color Manager: no profiles in PPD for qualifier '%s'\n",
++              qualifer_tmp);
+     goto out;
+   }
+ 
