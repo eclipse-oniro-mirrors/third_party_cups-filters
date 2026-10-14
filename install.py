@@ -57,6 +57,7 @@ def do_patch(target_dir):
         "ohos_image-zoom-bound-check.patch",  # Fix heap out-of-bounds read in zoom_bilinear()
         "ohos_pdftopdf-bookletShuffle-fix.patch",
         "ohos_colormanager-icc-path-validation.patch",
+        "backport-CVE-2026-64612.patch",
     ]
 
     for patch in patch_file:
