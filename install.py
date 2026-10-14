@@ -53,6 +53,7 @@ def do_patch(target_dir):
         "ohos_imagetopdf.patch",
         "ohos_pnm-calloc-init.patch",
         "ohos_ppdgenerator-bound-check.patch",
+        "backport-CVE-2026-64612.patch",
     ]
 
     for patch in patch_file:
