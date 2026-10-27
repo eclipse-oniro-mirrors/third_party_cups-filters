@@ -42,6 +42,7 @@ def do_patch(target_dir):
         "ohos_pdftoraster.patch",
         "backport-CVE-2023-24805.patch",
         "backport-CVE-2025-57812.patch",
+        "backport-CVE-2026-64612.patch",
     ]
 
     for patch in patch_file:
